@@ -1,123 +1,66 @@
-
-
-"""
-CLASSPOSE: One-piece WSI inference runner (Windows) - robust + compatible with your CLI
-
-Your CLI supports:
-  --model_config, --slide_path, --output_folder
-  --device, --batch_size, --tile_size, --overlap
-  --tta/--no-tta, --filter_artefacts/--no-filter_artefacts
-  --output_type {csv,spatialdata} ...
-  --tissue_detection_model_path, --artefact_detection_model_path
-
-Your CLI DOES NOT support:
-  --num_workers   (we do NOT pass it)
-
-This script:
-1) Checks paths
-2) Ensures predict_wsi.py compiles (restores from backups if needed)
-3) Patches worker() kwarg mismatch if found (nclasses -> n_classes in worker call only)
-4) Detects CUDA and falls back to CPU if torch is CPU-only
-5) Runs inference using GitHub-style module call
-6) Lists outputs
-"""
-
 from __future__ import annotations
 
 import os
 import sys
 import time
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional, Tuple
 import re
 
-# ==============================================================================
-# USER SETTINGS (edit if needed)
-# ==============================================================================
+# =============================================================================
+# USER SETTINGS
+# =============================================================================
 
 CLASSPOSE_SRC = r""
 PREDICT_WSI_PATH = r""
 
 SLIDE_PATH = r""
-OUTPUT_DIR = r""
 
-# GitHub preset model config
+# IMPORTANT: write locally first
+LOCAL_OUTPUT_DIR = r""
+FINAL_OUTPUT_DIR = r""
+
 MODEL_CONFIG = "conic"
 
-# Requested settings (script will auto-correct based on torch capabilities)
-REQUESTED_DEVICE = "cuda"  # will fall back to cpu if needed
+REQUESTED_DEVICE = "cuda"
 REQUESTED_BATCH_SIZE = 8
 REQUESTED_TILE_SIZE = 1024
 REQUESTED_OVERLAP = 64
 
-# CPU-safe defaults (used if CUDA not available)
-CPU_BATCH_SIZE = 1          # recommended on CPU
-CPU_TILE_SIZE = 1024        # if too slow or memory heavy, set 512
+CPU_BATCH_SIZE = 1
+CPU_TILE_SIZE = 512
 CPU_OVERLAP = 64
 
-# Flags
 USE_TTA = False
 FILTER_ARTEFACTS = False
 
-# Optional outputs
-# If you want csv or spatialdata, your CLI supports:
-#   --output_type csv
-# But note: repo README says for csv/spatialdata you may need tissue detection path.
-OUTPUT_TYPE: Optional[str] = None  # "csv" or "spatialdata" or None
-TISSUE_DETECTION_MODEL_PATH: Optional[str] = None  # set if OUTPUT_TYPE is csv/spatialdata
+# Optional output types (GeoJSON is default even without these)
+OUTPUT_TYPE: Optional[str] = None  # e.g. "csv" or "spatialdata"
+TISSUE_DETECTION_MODEL_PATH: Optional[str] = None  # required if OUTPUT_TYPE set per README
 
-
-# ==============================================================================
+# =============================================================================
 # PRINT HELPERS
-# ==============================================================================
+# =============================================================================
 
 def header(txt: str) -> None:
     print("\n" + "=" * 80)
     print(txt)
     print("=" * 80)
 
-
 def ok(msg: str) -> None:
     print(f"✅ {msg}")
-
 
 def warn(msg: str) -> None:
     print(f"⚠ {msg}")
 
-
 def err(msg: str) -> None:
     print(f"❌ {msg}")
 
-
-# ==============================================================================
-# CHECKS & RESTORE
-# ==============================================================================
-
-def ensure_paths() -> bool:
-    good = True
-
-    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
-    ok(f"Output folder ready: {OUTPUT_DIR}")
-
-    if not os.path.exists(SLIDE_PATH):
-        err(f"Slide not found: {SLIDE_PATH}")
-        good = False
-    else:
-        ok(f"Slide exists: {SLIDE_PATH}")
-
-    if not os.path.exists(PREDICT_WSI_PATH):
-        err(f"predict_wsi.py not found: {PREDICT_WSI_PATH}")
-        good = False
-    else:
-        ok(f"predict_wsi.py found: {PREDICT_WSI_PATH}")
-
-    if os.path.exists(CLASSPOSE_SRC) and CLASSPOSE_SRC not in sys.path:
-        sys.path.insert(0, CLASSPOSE_SRC)
-        ok(f"Added src to sys.path: {CLASSPOSE_SRC}")
-
-    return good
-
+# =============================================================================
+# UTIL
+# =============================================================================
 
 def compile_py(path: str) -> Tuple[bool, str]:
     try:
@@ -127,81 +70,36 @@ def compile_py(path: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
 
-
-def find_backup_candidates() -> list[Path]:
-    p = Path(PREDICT_WSI_PATH)
-    parent = p.parent
-    backups = sorted(
-        parent.glob(p.name + ".backup*"),
-        key=lambda x: x.stat().st_mtime,
-        reverse=True,
-    )
-    # also check predict_wsi.py.backup
-    plain = parent / (p.name + ".backup")
-    if plain.exists() and plain not in backups:
-        backups.append(plain)
-    return backups
-
-
-def restore_predict_wsi_if_broken() -> bool:
-    header("CHECKING predict_wsi.py HEALTH")
-    ok_now, msg = compile_py(PREDICT_WSI_PATH)
-    if ok_now:
-        ok("predict_wsi.py compiles.")
+def ensure_dir(path: str) -> bool:
+    try:
+        Path(path).mkdir(parents=True, exist_ok=True)
         return True
-
-    warn(f"predict_wsi.py is broken: {msg}")
-    warn("Attempting restore from backups...")
-
-    backups = find_backup_candidates()
-    if not backups:
-        err("No backup files found next to predict_wsi.py")
+    except Exception as e:
+        err(f"Cannot create directory: {path}\n{e}")
         return False
 
-    ok(f"Found {len(backups)} backup(s). Trying newest first...")
-    target = Path(PREDICT_WSI_PATH)
-    original = target.read_text(encoding="utf-8", errors="replace")
-
-    for b in backups:
-        try:
-            candidate = b.read_text(encoding="utf-8", errors="replace")
-            try:
-                compile(candidate, str(b), "exec")
-            except Exception:
-                warn(f"Backup does not compile, skipping: {b.name}")
-                continue
-
-            target.write_text(candidate, encoding="utf-8")
-            ok_after, msg_after = compile_py(PREDICT_WSI_PATH)
-            if ok_after:
-                ok(f"Restored predict_wsi.py from backup: {b.name}")
-                return True
-            else:
-                warn(f"Restored from {b.name} but still broken: {msg_after}")
-                target.write_text(original, encoding="utf-8")
-
-        except Exception as e:
-            warn(f"Failed to read/restore backup {b.name}: {e}")
-
-    err("No usable backup could restore a compilable predict_wsi.py")
-    return False
-
-
-# ==============================================================================
-# PATCH: worker(nclasses=...) -> worker(n_classes=...)
-# ==============================================================================
+def detect_device_and_params() -> Tuple[str, int, int, int]:
+    try:
+        import torch  # type: ignore
+        if REQUESTED_DEVICE.lower() == "cuda" and torch.cuda.is_available():
+            ok("CUDA available. Using cuda settings.")
+            return "cuda", REQUESTED_BATCH_SIZE, REQUESTED_TILE_SIZE, REQUESTED_OVERLAP
+        warn("CUDA not available in this PyTorch build. Using CPU settings.")
+        return "cpu", CPU_BATCH_SIZE, CPU_TILE_SIZE, CPU_OVERLAP
+    except Exception as e:
+        warn(f"Could not import torch ({e}). Using CPU settings.")
+        return "cpu", CPU_BATCH_SIZE, CPU_TILE_SIZE, CPU_OVERLAP
 
 def patch_worker_kwarg_if_needed() -> bool:
+    """
+    Patch only worker(...) call sites if they pass nclasses= to worker(),
+    changing to n_classes=.
+    """
     header("CHECKING worker() KWARG COMPATIBILITY")
 
     text = Path(PREDICT_WSI_PATH).read_text(encoding="utf-8", errors="replace")
-
-    if "worker(" not in text:
-        warn("No 'worker(' call found. Skipping.")
-        return True
-
-    # Patch only if worker call uses nclasses=
     pattern = re.compile(r"(\bworker\s*\([^)]*?)(\bnclasses\s*=)", re.DOTALL)
+
     if not pattern.search(text):
         ok("No worker(... nclasses=...) found. Patch not needed.")
         return True
@@ -212,7 +110,7 @@ def patch_worker_kwarg_if_needed() -> bool:
 
     patched = pattern.sub(r"\1n_classes=", text)
 
-    # extra conservative pass in worker call blocks
+    # conservative line pass while in worker call block
     patched_lines = []
     in_worker_call = False
     for line in patched.splitlines(True):
@@ -226,45 +124,15 @@ def patch_worker_kwarg_if_needed() -> bool:
     patched = "".join(patched_lines)
 
     Path(PREDICT_WSI_PATH).write_text(patched, encoding="utf-8")
-    ok("Patched worker() kwarg: nclasses -> n_classes")
 
     ok_compile, msg = compile_py(PREDICT_WSI_PATH)
     if not ok_compile:
-        err(f"After patch, predict_wsi.py does not compile: {msg}")
-        err("Restoring backup...")
+        err(f"Patch broke predict_wsi.py: {msg}. Restoring backup.")
         Path(PREDICT_WSI_PATH).write_text(text, encoding="utf-8")
         return False
 
-    ok("predict_wsi.py compiles after patch.")
+    ok("worker() kwarg patched safely.")
     return True
-
-
-# ==============================================================================
-# DEVICE SELECTION (NO CUDA TORCH -> CPU)
-# ==============================================================================
-
-def detect_device_and_params() -> Tuple[str, int, int, int]:
-    """
-    Returns: (device, batch_size, tile_size, overlap)
-    """
-    try:
-        import torch  # type: ignore
-
-        if REQUESTED_DEVICE.lower() == "cuda" and torch.cuda.is_available():
-            ok("CUDA available. Using cuda settings.")
-            return "cuda", REQUESTED_BATCH_SIZE, REQUESTED_TILE_SIZE, REQUESTED_OVERLAP
-
-        warn("CUDA not available in this PyTorch build. Using CPU settings.")
-        return "cpu", CPU_BATCH_SIZE, CPU_TILE_SIZE, CPU_OVERLAP
-
-    except Exception as e:
-        warn(f"Could not import torch ({e}). Using CPU settings.")
-        return "cpu", CPU_BATCH_SIZE, CPU_TILE_SIZE, CPU_OVERLAP
-
-
-# ==============================================================================
-# RUN INFERENCE (NO --num_workers)
-# ==============================================================================
 
 def build_cmd(device: str, batch_size: int, tile_size: int, overlap: int) -> list[str]:
     cmd = [
@@ -276,7 +144,7 @@ def build_cmd(device: str, batch_size: int, tile_size: int, overlap: int) -> lis
         "--slide_path",
         SLIDE_PATH,
         "--output_folder",
-        OUTPUT_DIR,
+        LOCAL_OUTPUT_DIR,
         "--device",
         device,
         "--batch_size",
@@ -287,36 +155,27 @@ def build_cmd(device: str, batch_size: int, tile_size: int, overlap: int) -> lis
         str(overlap),
     ]
 
-    # artefact filter toggle
-    if FILTER_ARTEFACTS:
-        cmd += ["--filter_artefacts"]
-    else:
-        cmd += ["--no-filter_artefacts"]
+    cmd += ["--filter_artefacts"] if FILTER_ARTEFACTS else ["--no-filter_artefacts"]
+    cmd += ["--tta"] if USE_TTA else ["--no-tta"]
 
-    # TTA toggle
-    if USE_TTA:
-        cmd += ["--tta"]
-    else:
-        cmd += ["--no-tta"]
-
-    # optional output type
     if OUTPUT_TYPE:
         cmd += ["--output_type", OUTPUT_TYPE]
-        # optional tissue model path (helpful/required for csv/spatialdata in some setups)
-        if TISSUE_DETECTION_MODEL_PATH:
-            cmd += ["--tissue_detection_model_path", TISSUE_DETECTION_MODEL_PATH]
+        if not TISSUE_DETECTION_MODEL_PATH:
+            raise RuntimeError(
+                "README requires --tissue_detection_model_path when using --output_type csv/spatialdata."
+            )
+        cmd += ["--tissue_detection_model_path", TISSUE_DETECTION_MODEL_PATH]
 
     return cmd
 
-
 def run_streaming(cmd: list[str]) -> int:
-    header("RUNNING CLASSPOSE (GitHub-style)")
+    header("RUNNING CLASSPOSE (outputs to LOCAL disk first)")
     print("Command:")
     print(" ".join([f'"{c}"' if " " in c else c for c in cmd]))
 
     env = os.environ.copy()
     if os.path.exists(CLASSPOSE_SRC):
-        env["PYTHONPATH"] = CLASSPOSE_SRC + (os.pathsep + env["PYTHONPATH"] if "PYTHONPATH" in env else "")
+        env["PYTHONPATH"] = CLASSPOSE_SRC + (os.pathsep + env.get("PYTHONPATH", ""))
 
     start = time.time()
     proc = subprocess.Popen(
@@ -340,64 +199,89 @@ def run_streaming(cmd: list[str]) -> int:
     print(f"Elapsed: {int(elapsed//60)}m {int(elapsed%60)}s")
     return rc
 
-
-def list_outputs() -> None:
-    header("OUTPUT FILES")
-    out = Path(OUTPUT_DIR)
+def list_outputs(folder: str) -> None:
+    header(f"OUTPUT FILES in {folder}")
+    out = Path(folder)
     files = sorted([p for p in out.glob("*") if p.is_file()])
     if not files:
-        warn("No output files found yet.")
+        warn("No output files found.")
         return
     for p in files:
         size_mb = p.stat().st_size / (1024 * 1024)
         print(f"- {p.name} ({size_mb:.2f} MB)")
 
+def copy_outputs_to_final() -> None:
+    """
+    Copy local outputs to network drive if available.
+    """
+    header("COPYING RESULTS TO FINAL OUTPUT (Z: drive)")
+    if not os.path.exists(FINAL_OUTPUT_DIR):
+        warn(f"Final output folder not reachable right now: {FINAL_OUTPUT_DIR}")
+        warn(f"Your results are SAFE locally in: {LOCAL_OUTPUT_DIR}")
+        return
 
-# ==============================================================================
+    ensure_dir(FINAL_OUTPUT_DIR)
+
+    for p in Path(LOCAL_OUTPUT_DIR).glob("*"):
+        if p.is_file():
+            dest = Path(FINAL_OUTPUT_DIR) / p.name
+            shutil.copy2(p, dest)
+            ok(f"Copied: {p.name} -> {dest}")
+    ok("Copy complete.")
+
+# =============================================================================
 # MAIN
-# ==============================================================================
+# =============================================================================
 
 def main() -> None:
-    header("CLASSPOSE: ONE-PIECE CHECK + PATCH + RUN (COMPATIBLE WITH YOUR CLI)")
+    header("CLASSPOSE SAFE RUNNER (LOCAL OUTPUT + COPY TO Z:)")
 
-    if not ensure_paths():
-        err("Fix missing paths and re-run.")
+    # basic checks
+    if not os.path.exists(SLIDE_PATH):
+        err(f"Slide not found: {SLIDE_PATH}")
         return
+    ok(f"Slide exists: {SLIDE_PATH}")
 
-    if not restore_predict_wsi_if_broken():
-        err("Cannot proceed: predict_wsi.py is broken and no backup restore worked.")
+    if not os.path.exists(PREDICT_WSI_PATH):
+        err(f"predict_wsi.py not found: {PREDICT_WSI_PATH}")
         return
+    ok(f"predict_wsi.py found: {PREDICT_WSI_PATH}")
 
+    if not ensure_dir(LOCAL_OUTPUT_DIR):
+        return
+    ok(f"Local output folder ready: {LOCAL_OUTPUT_DIR}")
+
+    # compile check
+    ok_compile, msg = compile_py(PREDICT_WSI_PATH)
+    if not ok_compile:
+        err(f"predict_wsi.py does not compile: {msg}")
+        err("Restore the file from git or a known-good backup first.")
+        return
+    ok("predict_wsi.py compiles.")
+
+    # patch worker kwarg only if needed
     if not patch_worker_kwarg_if_needed():
-        err("worker() kwarg patch failed.")
         return
 
     device, batch_size, tile_size, overlap = detect_device_and_params()
-
-    ok(f"Using model_config: {MODEL_CONFIG}")
     ok(f"Device: {device}")
     ok(f"Batch size: {batch_size}")
     ok(f"Tile size: {tile_size}")
     ok(f"Overlap: {overlap}")
 
-    if device == "cpu":
-        warn("Running on CPU (PyTorch is CPU-only). This will be slow for 2145 tiles.")
-        warn("If it is too slow, set CPU_TILE_SIZE=512 and keep CPU_BATCH_SIZE=1.")
-
     cmd = build_cmd(device, batch_size, tile_size, overlap)
     rc = run_streaming(cmd)
 
-    if rc == 0:
-        ok("Inference finished successfully.")
-        list_outputs()
-    else:
-        err("Inference failed.")
-        print("\nNext steps if CPU is too slow or crashes:")
-        print("- Set CPU_TILE_SIZE=512")
-        print("- Keep CPU_BATCH_SIZE=1")
-        print("- Optionally enable tissue detection to reduce tiles")
-        print("  (requires tissue model path if you use csv/spatialdata outputs)")
+    # Always list local outputs (even if rc != 0 there might be partials)
+    list_outputs(LOCAL_OUTPUT_DIR)
 
+    if rc == 0:
+        ok("Inference completed. Attempting copy to Z: ...")
+        copy_outputs_to_final()
+        list_outputs(FINAL_OUTPUT_DIR)
+    else:
+        warn("Inference failed. Your LOCAL folder may still contain partial outputs.")
+        warn(f"Check: {LOCAL_OUTPUT_DIR}")
 
 if __name__ == "__main__":
     try:
